@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASCII Sunflower</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; justify-content: center; align-items: center; }
+  canvas { height: 100vh !important; width: auto !important; max-width: 100vw; object-fit: contain; }
+  #hint { position: fixed; bottom: 10px; left: 0; right: 0; text-align: center;
+          font: 12px monospace; color: #ffffff55; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="hint">click or press R to replay the bloom</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
+<script>
+(async () => {
+  /* ---------- config ---------- */
+  const COLS = 130, ROWS = 130;     // ascii grid
+  const CW = 6, CH = 10;            // pixel size of one character cell
+  const SS = 2;                     // supersampling per cell (SS x SS pixels averaged)
+  const W = COLS * CW, H = ROWS * CH; // virtual scene size (matches screen space)
+  const RAMP = ".,:;-~=+*#%@";
+  const BASE = { x: 390, y: 1235 };
+
+  /* ---------- display app (shows the ascii canvas) ---------- */
+  const app = new PIXI.Application();
+  await app.init({
+    width: W, height: H, background: 0x000000,
+    antialias: false, resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true,
+  });
+  document.body.appendChild(app.canvas);
+
+  /* ---------- offscreen vector scene ---------- */
+  const rt = PIXI.RenderTexture.create({ width: COLS * SS, height: ROWS * SS });
+  const scene = new PIXI.Container();
+  const world = new PIXI.Container();
+  world.scale.set((COLS * SS) / W, (ROWS * SS) / H);
+  scene.addChild(world);
+
+  const grassLayer = new PIXI.Container();
+  const stemLayer = new PIXI.Container();
+  const leafLayer = new PIXI.Container();
+  const flowerLayer = new PIXI.Container();
+  world.addChild(grassLayer, stemLayer, leafLayer, flowerLayer);
+
+  /* ---------- helpers ---------- */
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = (t) => { const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const deg = Math.PI / 180;
+
+  /* ---------- petal / leaf shapes ---------- */
+  function makeRay(L, w, color, accent, base) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(w * 1.3, -L * 0.35, w * 0.8, -L * 0.8, 0, -L)
+      .bezierCurveTo(-w * 0.8, -L * 0.8, -w * 1.3, -L * 0.35, 0, 0)
+      .fill({ color });
+    g.moveTo(0, -L * 0.4)
+      .bezierCurveTo(w * 0.42, -L * 0.55, w * 0.25, -L * 0.8, 0, -L * 0.92)
+      .bezierCurveTo(-w * 0.25, -L * 0.8, -w * 0.42, -L * 0.55, 0, -L * 0.4)
+      .fill({ color: accent, alpha: 0.7 });
+    // warmer orange where the ray meets the dark centre
+    g.moveTo(0, 0)
+      .bezierCurveTo(w * 1.05, -L * 0.2, w * 0.8, -L * 0.5, 0, -L * 0.62)
+      .bezierCurveTo(-w * 0.8, -L * 0.5, -w * 1.05, -L * 0.2, 0, 0)
+      .fill({ color: base, alpha: 0.55 });
+    return g;
+  }
+
+  // the seed-packed centre, with seeds laid out in a natural spiral
+  function makeDisk(R) {
+    const g = new PIXI.Graphics();
+    g.circle(0, 0, R).fill({ color: 0x4f2c10 });
+    const SEEDS = 260;
+    for (let i = 1; i <= SEEDS; i++) {
+      const u = Math.sqrt(i / SEEDS), a = i * 137.5 * deg;
+      g.circle(Math.cos(a) * R * 0.97 * u, Math.sin(a) * R * 0.97 * u, R * 0.035)
+        .fill({ color: u > 0.72 ? 0xb9802a : 0x2c170a });
+    }
+    g.circle(0, 0, R * 0.2).fill({ color: 0x77702a });
+    return g;
+  }
+
+  function makeLeaf(len, wide = 0.17) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(len * wide, -len * 0.3, len * wide * 0.76, -len * 0.75, 0, -len)
+      .bezierCurveTo(-len * wide * 0.76, -len * 0.75, -len * wide, -len * 0.3, 0, 0)
+      .fill({ color: 0x2f9a35 });
+    g.moveTo(0, -len * 0.05).lineTo(0, -len * 0.9).stroke({ width: 2.5, color: 0xb6f08a, alpha: 0.7 });
+    return g;
+  }
+
+  /* ---------- bouquet definition ---------- */
+  //  x,y = centre of the sunflower, L = radius of the head, d = start delay (s)
+  const DEFS = [{ x: 390, y: 490, L: 300, d: 0 }];
+
+  const STEM_TIME = 2.2, BLOOM_DELAY = 1.9, BLOOM_TIME = 2.6;
+  let flowers = [];
+
+  function buildScene() {
+    [grassLayer, stemLayer, leafLayer, flowerLayer].forEach((l) => l.removeChildren().forEach((c) => c.destroy({ children: true })));
+    flowers = [];
+
+    // draw back-to-front: top flowers first
+    const sorted = [...DEFS].sort((a, b) => a.y - b.y);
+    sorted.forEach((def) => {
+      const sx = BASE.x + rnd(-28, 28), sy = BASE.y;
+      const ctrl = { x: lerp(sx, def.x, 0.35) + rnd(-20, 20), y: def.y + (sy - def.y) * 0.5 };
+      const stemG = new PIXI.Graphics();
+      stemLayer.addChild(stemG);
+
+      // big, broad leaves
+      const firstSide = Math.random() < 0.5 ? 1 : -1;
+      const leaves = [0.2, 0.38, 0.56].map((t, i) => {
+        const lf = makeLeaf(rnd(190, 250), 0.38);
+        lf.t = t; lf.side = i % 2 ? -firstSide : firstSide;
+        lf.scale.set(0);
+        leafLayer.addChild(lf);
+        return lf;
+      });
+
+      const head = new PIXI.Container();
+      const inner = new PIXI.Container();
+      head.addChild(inner);
+      head.finalRot = rnd(-0.3, 0.3);
+      const L = def.L;
+
+      // green bracts show while it is a bud, then hide behind the rays
+      for (let k = 0; k < 18; k++) {
+        const b = makeLeaf(L * 0.66, 0.2);
+        b.rotation = (k * 360 / 18) * deg;
+        inner.addChild(b);
+      }
+      // two rings of rays: darker behind, brighter in front
+      const rays = [];
+      [
+        { color: 0xe89a10, accent: 0xffc93a, len: 1.0, off: 7.5 },
+        { color: 0xffcc14, accent: 0xfff07a, len: 0.9, off: 0 },
+      ].forEach((ring) => {
+        for (let k = 0; k < 24; k++) {
+          const ray = makeRay(L * ring.len * rnd(0.92, 1.05), L * 0.1, ring.color, ring.accent, 0xe07010);
+          ray.rotation = (ring.off + (k * 360) / 24 + rnd(-2.5, 2.5)) * deg;
+          ray.lag = rnd(0, 0.4); // rays open at slightly different moments
+          ray.scale.set(0);
+          inner.addChild(ray);
+          rays.push(ray);
+        }
+      });
+      const disk = makeDisk(L * 0.42);
+      inner.addChild(disk);
+      head.visible = false;
+      flowerLayer.addChild(head);
+
+      const f = {
+        def, sx, sy, ctrl, stemG, leaves, head, inner, rays, disk,
+        swayPhase: rnd(0, 6.28),
+      };
+      flowers.push(f);
+    });
+  }
+
+  const bez = (f, t) => {
+    const u = 1 - t;
+    return {
+      x: u * u * f.sx + 2 * u * t * f.ctrl.x + t * t * f.def.x,
+      y: u * u * f.sy + 2 * u * t * f.ctrl.y + t * t * f.def.y,
+    };
+  };
+  const bezAngle = (f, t) => {
+    const u = 1 - t;
+    const dx = 2 * u * (f.ctrl.x - f.sx) + 2 * t * (f.def.x - f.ctrl.x);
+    const dy = 2 * u * (f.ctrl.y - f.sy) + 2 * t * (f.def.y - f.ctrl.y);
+    return Math.atan2(dx, -dy); // 0 = pointing up
+  };
+
+  /* ---------- per-frame scene update ---------- */
+  function updateScene(t) {
+    flowers.forEach((f) => {
+      const local = t - f.def.d;
+      const p = easeInOut(clamp01(local / STEM_TIME));
+      const o = easeOutBack(clamp01((local - BLOOM_DELAY) / BLOOM_TIME));
+      const oc = clamp01(o);
+      const sway = Math.sin(t * 1.3 + f.swayPhase) * 0.02;
+
+      // stem: polyline up to p
+      f.stemG.clear();
+      if (p > 0.001) {
+        const N = 28, n = Math.max(2, Math.ceil(N * p));
+        const pts = [];
+        for (let i = 0; i <= n; i++) pts.push(bez(f, (i / n) * p));
+        f.stemG.moveTo(pts[0].x, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x, q.y));
+        f.stemG.stroke({ width: 20, color: 0x2a8a2e, cap: "round", join: "round" });
+        f.stemG.moveTo(pts[0].x - 2, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x - 2, q.y));
+        f.stemG.stroke({ width: 3, color: 0x8fe07a, alpha: 0.7, cap: "round", join: "round" });
+      }
+
+      // leaves
+      f.leaves.forEach((lf) => {
+        const g = easeOutCubic(clamp01((p - lf.t) / 0.25));
+        const q = bez(f, lf.t);
+        lf.x = q.x; lf.y = q.y;
+        lf.rotation = bezAngle(f, lf.t) + lf.side * (62 * deg) + sway * 2;
+        lf.scale.set(g);
+      });
+
+      // head: bud at stem tip, then bloom
+      const tip = bez(f, p);
+      f.head.visible = p > 0.05;
+      f.head.x = tip.x; f.head.y = tip.y;
+      f.head.rotation = lerp(bezAngle(f, Math.max(p, 0.02)), f.head.finalRot, easeInOut(oc)) + sway;
+      const budScale = lerp(0.18, 1, o);
+      f.inner.scale.set(budScale, budScale * 0.94); // turned slightly toward the viewer
+      f.disk.scale.set(lerp(0.45, 1, oc));
+
+      f.rays.forEach((ray) => {
+        const open = easeOutCubic(clamp01((oc - ray.lag) / (1 - ray.lag)));
+        ray.scale.set(lerp(0.4, 1, open), open);
+      });
+    });
+  }
+
+  /* ---------- ascii canvas ---------- */
+  const ascii = document.createElement("canvas");
+  ascii.width = W; ascii.height = H;
+  const ctx = ascii.getContext("2d");
+  ctx.textBaseline = "top";
+  ctx.font = `bold ${CH}px "SF Mono", Menlo, Consolas, monospace`;
+  const sprite = new PIXI.Sprite(PIXI.Texture.from(ascii));
+  app.stage.addChild(sprite);
+
+  const stars = [...Array(90)].map(() => ({
+    c: Math.floor(rnd(0, COLS)), r: Math.floor(rnd(0, ROWS)), ph: rnd(0, 6.28), sp: rnd(0.8, 2.4),
+  }));
+
+  function readPixels() {
+    const res = app.renderer.extract.pixels({ target: rt });
+    return res && res.pixels ? res : { pixels: res, width: rt.width, height: rt.height };
+  }
+
+  function drawAscii(t) {
+    app.renderer.render({ container: scene, target: rt, clear: true, clearColor: [0, 0, 0, 1] });
+    const { pixels, width: pw } = readPixels();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // twinkling background stars
+    ctx.font = `${CH}px "SF Mono", Menlo, Consolas, monospace`;
+    stars.forEach((s) => {
+      const a = 0.15 + 0.35 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+      ctx.fillText(".", s.c * CW, s.r * CH);
+    });
+
+    ctx.font = `bold ${CH + 1}px "SF Mono", Menlo, Consolas, monospace`;
+    const inv = 1 / (SS * SS);
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        let R = 0, G = 0, B = 0;
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const i = ((r * SS + sy) * pw + (c * SS + sx)) * 4;
+            R += pixels[i]; G += pixels[i + 1]; B += pixels[i + 2];
+          }
+        }
+        R *= inv; G *= inv; B *= inv;
+        const lum = 0.299 * R + 0.587 * G + 0.114 * B;
+        if (lum < 14) continue;
+        let idx = Math.round(clamp01(lum / 215) * (RAMP.length - 1));
+        const j = Math.random();
+        if (j < 0.08) idx = Math.max(0, idx - 1); else if (j > 0.94) idx = Math.min(RAMP.length - 1, idx + 1);
+        const k = 1.25;
+        ctx.fillStyle = `rgb(${Math.min(255, R * k) | 0},${Math.min(255, G * k) | 0},${Math.min(255, B * k) | 0})`;
+        ctx.fillText(RAMP[idx], c * CW, r * CH);
+      }
+    }
+    sprite.texture.source.update();
+  }
+
+  /* ---------- run / replay ---------- */
+  let t0 = performance.now();
+  function replay() { buildScene(); t0 = performance.now(); }
+  buildScene();
+
+  app.ticker.add(() => {
+    const t = (performance.now() - t0) / 1000;
+    updateScene(t);
+    drawAscii(t);
+  });
+
+  window.addEventListener("keydown", (e) => { if (e.key.toLowerCase() === "r") replay(); });
+  window.addEventListener("pointerdown", replay);
+})();
+</script>
+</body>
+</html>

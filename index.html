@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>flowers</title>
+<style>
+  html, body, iframe { margin: 0; width: 100%; height: 100%; border: 0; background: #000; display: block; }
+</style>
+</head>
+<body>
+<iframe id="flower" title="today's flower"></iframe>
+<script>
+  // To add a flower: put its file in flowers/ and add its name here.
+  const pages = ["tulips", "rose", "sunflower", "lilies"];
+
+  // Random order, but worked out from the date, so everyone gets the same
+  // flower all day and no server is needed. Every flower appears once before
+  // any repeats, and the same flower never shows two days running.
+  function shuffledRound(round) {
+    let seed = (round * 2654435761) >>> 0;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) >>> 0;
+      let x = seed;
+      x = Math.imul(x ^ (x >>> 15), x | 1);
+      x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+      return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+    };
+    const order = [...pages];
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    return order;
+  }
+
+  function flowerForDay(day) {
+    const round = Math.floor(day / pages.length);
+    const order = shuffledRound(round);
+    const lastShown = shuffledRound(round - 1)[pages.length - 1];
+    if (order[0] === lastShown) [order[0], order[1]] = [order[1], order[0]];
+    return order[day % pages.length];
+  }
+
+  const now = new Date();
+  const today = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86400000);
+  const frame = document.getElementById("flower");
+  frame.onload = () => frame.contentWindow.focus(); // so pressing R works straight away
+  frame.src = `flowers/${flowerForDay(today)}.html`;
+</script>
+</body>
+</html>

@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASCII Lily Bouquet</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; justify-content: center; align-items: center; }
+  canvas { height: 100vh !important; width: auto !important; max-width: 100vw; object-fit: contain; }
+  #hint { position: fixed; bottom: 10px; left: 0; right: 0; text-align: center;
+          font: 12px monospace; color: #ffffff55; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="hint">click or press R to replay the bloom</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
+<script>
+(async () => {
+  /* ---------- config ---------- */
+  const COLS = 130, ROWS = 130;     // ascii grid
+  const CW = 6, CH = 10;            // pixel size of one character cell
+  const SS = 2;                     // supersampling per cell (SS x SS pixels averaged)
+  const W = COLS * CW, H = ROWS * CH; // virtual scene size (matches screen space)
+  const RAMP = ".,:;-~=+*#%@";
+  const BASE = { x: 390, y: 1235 };
+
+  /* ---------- display app (shows the ascii canvas) ---------- */
+  const app = new PIXI.Application();
+  await app.init({
+    width: W, height: H, background: 0x000000,
+    antialias: false, resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true,
+  });
+  document.body.appendChild(app.canvas);
+
+  /* ---------- offscreen vector scene ---------- */
+  const rt = PIXI.RenderTexture.create({ width: COLS * SS, height: ROWS * SS });
+  const scene = new PIXI.Container();
+  const world = new PIXI.Container();
+  world.scale.set((COLS * SS) / W, (ROWS * SS) / H);
+  scene.addChild(world);
+
+  const grassLayer = new PIXI.Container();
+  const stemLayer = new PIXI.Container();
+  const leafLayer = new PIXI.Container();
+  const flowerLayer = new PIXI.Container();
+  world.addChild(grassLayer, stemLayer, leafLayer, flowerLayer);
+
+  /* ---------- helpers ---------- */
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = (t) => { const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const deg = Math.PI / 180;
+  const normAngle = (a) => ((((a + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
+
+  /* ---------- petal / leaf shapes ---------- */
+  function makePetal(L, w, color, accent, dark) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(w * 0.95, -L * 0.25, w * 0.7, -L * 0.75, 0, -L)
+      .bezierCurveTo(-w * 0.7, -L * 0.75, -w * 0.95, -L * 0.25, 0, 0)
+      .fill({ color });
+    // lighter/darker inner stripe
+    g.moveTo(0, -L * 0.05)
+      .bezierCurveTo(w * 0.38, -L * 0.3, w * 0.25, -L * 0.7, 0, -L * 0.92)
+      .bezierCurveTo(-w * 0.25, -L * 0.7, -w * 0.38, -L * 0.3, 0, -L * 0.05)
+      .fill({ color: accent, alpha: 0.55 });
+    // center vein
+    g.moveTo(0, -L * 0.08).lineTo(0, -L * 0.85).stroke({ width: 3, color: dark, alpha: 0.55 });
+    // freckles near the throat
+    for (let i = 0; i < 7; i++) {
+      g.circle(rnd(-w * 0.28, w * 0.28), -rnd(L * 0.12, L * 0.5), rnd(1.6, 3)).fill({ color: dark, alpha: 0.8 });
+    }
+    return g;
+  }
+
+  function makeLeaf(len) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(len * 0.17, -len * 0.3, len * 0.13, -len * 0.75, 0, -len)
+      .bezierCurveTo(-len * 0.13, -len * 0.75, -len * 0.17, -len * 0.3, 0, 0)
+      .fill({ color: 0x2f9a35 });
+    g.moveTo(0, -len * 0.05).lineTo(0, -len * 0.9).stroke({ width: 2.5, color: 0xb6f08a, alpha: 0.7 });
+    return g;
+  }
+
+  /* ---------- bouquet definition ---------- */
+  //  x,y = flower head position, L = petal length, c = [petal, accent, freckle], d = start delay (s)
+  const DEFS = [
+    { x: 395, y: 500, L: 165, c: [0xd8232a, 0xff6a5a, 0x5e0710], d: 0.7, tilt: 0.95 },
+    { x: 262, y: 725, L: 138, c: [0xd94fb5, 0xff9be0, 0x6a1257], d: 0.25, tilt: 0.85 },
+    { x: 545, y: 690, L: 150, c: [0xf1e2cc, 0xffffff, 0x946b3a], d: 1.0, tilt: 0.8 },
+    { x: 228, y: 540, L: 125, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 0.0, tilt: 0.75 },
+    { x: 565, y: 495, L: 125, c: [0x9c1632, 0xe0485f, 0x3a0510], d: 0.45, tilt: 0.8 },
+    { x: 330, y: 840, L: 120, c: [0xe6a07a, 0xffd2b8, 0x8a3f1e], d: 0.85, tilt: 0.9 },
+    { x: 470, y: 880, L: 115, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 1.3, tilt: 0.85 },
+    { x: 405, y: 690, L: 135, c: [0xb0307f, 0xf07cc0, 0x4a0a35], d: 1.55, tilt: 0.95 },
+    { x: 628, y: 640, L: 100, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 1.2, tilt: 0.7 },
+    { x: 165, y: 720, L: 100, c: [0xf1e2cc, 0xffffff, 0x946b3a], d: 0.6, tilt: 0.7 },
+  ];
+
+  const STEM_TIME = 2.2, BLOOM_DELAY = 1.9, BLOOM_TIME = 2.6;
+  let flowers = [];
+
+  function buildScene() {
+    [grassLayer, stemLayer, leafLayer, flowerLayer].forEach((l) => l.removeChildren().forEach((c) => c.destroy({ children: true })));
+    flowers = [];
+
+    // grass blades at the base
+    for (let i = 0; i < 16; i++) {
+      const b = makeLeaf(rnd(110, 210));
+      b.x = BASE.x + rnd(-55, 55); b.y = BASE.y + rnd(0, 20);
+      b.baseRot = rnd(-38, 38) * deg;
+      b.delay = rnd(0, 0.9);
+      b.scale.set(0);
+      grassLayer.addChild(b);
+    }
+
+    // draw back-to-front: top flowers first
+    const sorted = [...DEFS].sort((a, b) => a.y - b.y);
+    sorted.forEach((def) => {
+      const sx = BASE.x + rnd(-28, 28), sy = BASE.y;
+      const ctrl = { x: lerp(sx, def.x, 0.1) + rnd(-25, 25), y: def.y + (sy - def.y) * 0.5 };
+      const stemG = new PIXI.Graphics();
+      stemLayer.addChild(stemG);
+
+      // leaves
+      const leaves = [];
+      [0.28, 0.5, 0.7].forEach((t, i) => {
+        const lf = makeLeaf(rnd(85, 135));
+        lf.t = t; lf.side = (i + Math.round(Math.random())) % 2 ? 1 : -1;
+        lf.scale.set(0);
+        leafLayer.addChild(lf);
+        leaves.push(lf);
+      });
+
+      // head
+      const head = new PIXI.Container();
+      const inner = new PIXI.Container();
+      head.addChild(inner);
+      const petals = [];
+      const [pc, ac, dk] = def.c;
+      const Lw = def.L, ww = def.L * 0.3;
+      // back ring (0,120,240) then front ring (60,180,300)
+      [0, 1].forEach((ring) => {
+        for (let k = 0; k < 3; k++) {
+          const idx = ring * 3 + k;
+          const shade = ring === 0 ? PIXI.Color.shared.setValue(pc).multiply(0xd8d8d8).toNumber() : pc;
+          const p = makePetal(Lw * (ring ? 1 : 0.94), ww * (ring ? 1 : 0.95), shade, ac, dk);
+          p.openAngle = normAngle((ring * 60 + k * 120 + rnd(-8, 8)) * deg);
+          p.closedAngle = (idx - 2.5) * 4 * deg;
+          inner.addChild(p);
+          petals.push(p);
+        }
+      });
+      const stamens = new PIXI.Graphics();
+      inner.addChild(stamens);
+      head.visible = false;
+      flowerLayer.addChild(head);
+
+      flowers.push({
+        def, sx, sy, ctrl, stemG, leaves, head, inner, petals, stamens,
+        headRot: rnd(0, Math.PI * 2),
+        swayPhase: rnd(0, 6.28), stamenSeed: [...Array(6)].map(() => rnd(-1, 1)),
+      });
+    });
+  }
+
+  const bez = (f, t) => {
+    const u = 1 - t;
+    return {
+      x: u * u * f.sx + 2 * u * t * f.ctrl.x + t * t * f.def.x,
+      y: u * u * f.sy + 2 * u * t * f.ctrl.y + t * t * f.def.y,
+    };
+  };
+  const bezAngle = (f, t) => {
+    const u = 1 - t;
+    const dx = 2 * u * (f.ctrl.x - f.sx) + 2 * t * (f.def.x - f.ctrl.x);
+    const dy = 2 * u * (f.ctrl.y - f.sy) + 2 * t * (f.def.y - f.ctrl.y);
+    return Math.atan2(dx, -dy); // 0 = pointing up
+  };
+
+  /* ---------- per-frame scene update ---------- */
+  function updateScene(t) {
+    grassLayer.children.forEach((b) => {
+      const g = easeOutCubic(clamp01((t - b.delay) / 1.4));
+      b.scale.set(g * 0.9, g);
+      b.rotation = b.baseRot + Math.sin(t * 1.1 + b.x) * 0.03 * g;
+    });
+
+    flowers.forEach((f) => {
+      const local = t - f.def.d;
+      const p = easeInOut(clamp01(local / STEM_TIME));
+      const o = easeOutBack(clamp01((local - BLOOM_DELAY) / BLOOM_TIME));
+      const oc = clamp01(o);
+      const sway = Math.sin(t * 1.3 + f.swayPhase) * 0.02;
+
+      // stem: polyline up to p
+      f.stemG.clear();
+      if (p > 0.001) {
+        const N = 28, n = Math.max(2, Math.ceil(N * p));
+        const pts = [];
+        for (let i = 0; i <= n; i++) pts.push(bez(f, (i / n) * p));
+        f.stemG.moveTo(pts[0].x, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x, q.y));
+        f.stemG.stroke({ width: 10, color: 0x2a8a2e, cap: "round", join: "round" });
+        f.stemG.moveTo(pts[0].x - 2, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x - 2, q.y));
+        f.stemG.stroke({ width: 3, color: 0x8fe07a, alpha: 0.7, cap: "round", join: "round" });
+      }
+
+      // leaves
+      f.leaves.forEach((lf) => {
+        const g = easeOutCubic(clamp01((p - lf.t) / 0.25));
+        const q = bez(f, lf.t);
+        lf.x = q.x; lf.y = q.y;
+        lf.rotation = bezAngle(f, lf.t) + lf.side * (52 * deg) + sway * 2;
+        lf.scale.set(g);
+      });
+
+      // head: bud at stem tip, then bloom
+      const tip = bez(f, p);
+      f.head.visible = p > 0.05;
+      f.head.x = tip.x; f.head.y = tip.y;
+      const budScale = lerp(0.18, 1, oc);
+      const stemAng = bezAngle(f, Math.max(p, 0.02));
+      f.head.rotation = lerp(stemAng, f.headRot, easeInOut(oc)) + sway;
+      f.inner.scale.set(budScale * lerp(1, 1, oc), budScale * lerp(1, f.def.tilt, oc));
+
+      f.petals.forEach((pt) => {
+        pt.rotation = lerp(pt.closedAngle, pt.openAngle, oc);
+        pt.scale.set(lerp(0.5, 1, oc), lerp(0.85, 1, oc));
+      });
+
+      // stamens
+      f.stamens.clear();
+      if (oc > 0.45) {
+        const s = clamp01((oc - 0.45) / 0.55);
+        const L = f.def.L * 0.55 * s;
+        f.stamenSeed.forEach((r, i) => {
+          const a = (i / 6) * Math.PI * 2 + r * 0.4;
+          const ex = Math.sin(a) * L * 0.9, ey = -Math.cos(a) * L * 0.9;
+          f.stamens.moveTo(0, 0).lineTo(ex, ey).stroke({ width: 3, color: 0xf5e7a0, alpha: 0.95 });
+          f.stamens.ellipse(ex, ey, 6 * s + 1, 9 * s + 1).fill({ color: 0x8a3a10 });
+        });
+        f.stamens.circle(0, 0, 7 * s).fill({ color: 0xb8e060 });
+      }
+    });
+  }
+
+  /* ---------- ascii canvas ---------- */
+  const ascii = document.createElement("canvas");
+  ascii.width = W; ascii.height = H;
+  const ctx = ascii.getContext("2d");
+  ctx.textBaseline = "top";
+  ctx.font = `bold ${CH}px "SF Mono", Menlo, Consolas, monospace`;
+  const sprite = new PIXI.Sprite(PIXI.Texture.from(ascii));
+  app.stage.addChild(sprite);
+
+  const stars = [...Array(90)].map(() => ({
+    c: Math.floor(rnd(0, COLS)), r: Math.floor(rnd(0, ROWS)), ph: rnd(0, 6.28), sp: rnd(0.8, 2.4),
+  }));
+
+  function readPixels() {
+    const res = app.renderer.extract.pixels({ target: rt });
+    return res && res.pixels ? res : { pixels: res, width: rt.width, height: rt.height };
+  }
+
+  function drawAscii(t) {
+    app.renderer.render({ container: scene, target: rt, clear: true, clearColor: [0, 0, 0, 1] });
+    const { pixels, width: pw } = readPixels();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // twinkling background stars
+    ctx.font = `${CH}px "SF Mono", Menlo, Consolas, monospace`;
+    stars.forEach((s) => {
+      const a = 0.15 + 0.35 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+      ctx.fillText(".", s.c * CW, s.r * CH);
+    });
+
+    ctx.font = `bold ${CH + 1}px "SF Mono", Menlo, Consolas, monospace`;
+    const inv = 1 / (SS * SS);
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        let R = 0, G = 0, B = 0;
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const i = ((r * SS + sy) * pw + (c * SS + sx)) * 4;
+            R += pixels[i]; G += pixels[i + 1]; B += pixels[i + 2];
+          }
+        }
+        R *= inv; G *= inv; B *= inv;
+        const lum = 0.299 * R + 0.587 * G + 0.114 * B;
+        if (lum < 14) continue;
+        let idx = Math.round(clamp01(lum / 215) * (RAMP.length - 1));
+        const j = Math.random();
+        if (j < 0.08) idx = Math.max(0, idx - 1); else if (j > 0.94) idx = Math.min(RAMP.length - 1, idx + 1);
+        const k = 1.25;
+        ctx.fillStyle = `rgb(${Math.min(255, R * k) | 0},${Math.min(255, G * k) | 0},${Math.min(255, B * k) | 0})`;
+        ctx.fillText(RAMP[idx], c * CW, r * CH);
+      }
+    }
+    sprite.texture.source.update();
+  }
+
+  /* ---------- run / replay ---------- */
+  let t0 = performance.now();
+  function replay() { buildScene(); t0 = performance.now(); }
+  buildScene();
+
+  app.ticker.add(() => {
+    const t = (performance.now() - t0) / 1000;
+    updateScene(t);
+    drawAscii(t);
+  });
+
+  window.addEventListener("keydown", (e) => { if (e.key.toLowerCase() === "r") replay(); });
+  window.addEventListener("pointerdown", replay);
+})();
+</script>
+</body>
+</html>

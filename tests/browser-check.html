@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>flowers: browser check</title>
+<style>
+  body { margin: 0; padding: 12px; background: #111; color: #ddd; font: 12px monospace; }
+  #status { font-size: 14px; margin-bottom: 10px; }
+  table { border-collapse: collapse; margin-bottom: 14px; }
+  td, th { padding: 2px 8px; border-bottom: 1px solid #333; text-align: left; }
+  .pass { color: #7fe07f; } .fail { color: #ff7a7a; font-weight: bold; }
+  #sheet { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+  #sheet figure { margin: 0; } #sheet figcaption { padding: 2px 0; }
+  #sheet canvas { width: 100%; display: block; background: #000; }
+  #stage { position: fixed; right: 0; bottom: 0; display: flex; gap: 2px; }
+  #stage iframe { width: 234px; height: 390px; border: 0; background: #000; }
+</style>
+</head>
+<body>
+<!--
+  Loads every flower and measures its real rendered frames. Serve the repo over
+  http first, for example: python -m http.server 8123
+  then open http://localhost:8123/tests/browser-check.html in a visible tab.
+  On a slow machine add ?batch=1 to load one flower at a time.
+  Add ?only=rose,lilies to check some flowers, ?big for larger thumbnails, or
+  ?end=10 to stop early when you only want to look. (Stopping early skips most colour
+  changes, so those flowers will report a failure.)
+  Results are also left in window.results as data.
+-->
+<div id="status">starting...</div>
+<table id="table"></table>
+<div id="sheet"></div>
+<div id="stage"></div>
+<script>
+(async () => {
+  const params = new URLSearchParams(location.search);
+  const AT_BUD = 1.3, AT_BLOOM = 7.5, END = Number(params.get("end")) || 23, STEP = 0.1;
+  const BATCH = Number(params.get("batch")) || 3; // fewer at once gives smoother frames on a slow machine
+  // a 4 x 6 grid, so a change in one flower of a big bunch still shows up
+  const CELLS = [];
+  for (let cy = 0; cy < 6; cy++) for (let cx = 0; cx < 4; cx++) CELLS.push([cx / 4, cy / 6, (cx + 1) / 4, (cy + 1) / 6]);
+  const THUMB_W = 195, THUMB_H = 325;
+  const statusEl = document.getElementById("status");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  if (params.has("big")) document.getElementById("sheet").style.gridTemplateColumns = "repeat(auto-fill, minmax(330px, 1fr))";
+
+  const indexHtml = await (await fetch("../index.html", { cache: "no-store" })).text();
+  const allPages = [...indexHtml.match(/const pages = \[([\s\S]*?)\];/)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const pages = params.get("only") ? params.get("only").split(",") : allPages;
+
+  const errorHook = `<script>window.__errors = [];
+    addEventListener("error", (e) => __errors.push(String(e.message || (e.target && e.target.src) || e)), true);
+    addEventListener("unhandledrejection", (e) => __errors.push("rejected: " + e.reason));
+    const __ce = console.error; console.error = (...a) => { __errors.push(a.join(" ")); __ce(...a); };
+  <\/script>`;
+
+  // Takes one frame from the flower. WebGL only keeps its picture for the moment
+  // after drawing, so this grabs it from the page's own animation frame and retries.
+  function grab(frame) {
+    const win = frame.contentWindow;
+    const src = frame.contentDocument.querySelector("canvas");
+    const out = document.createElement("canvas");
+    out.width = THUMB_W; out.height = THUMB_H;
+    const ctx = out.getContext("2d", { willReadFrequently: true });
+    return new Promise((resolve) => {
+      let tries = 0;
+      const attempt = () => {
+        ctx.fillStyle = "#000"; ctx.fillRect(0, 0, THUMB_W, THUMB_H);
+        ctx.drawImage(src, 0, 0, THUMB_W, THUMB_H);
+        const d = ctx.getImageData(0, 0, THUMB_W, THUMB_H).data;
+        let lit = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 60) lit++;
+        if (lit > 0 || ++tries > 20) resolve({ canvas: out, data: d, lit: lit / (THUMB_W * THUMB_H) });
+        else win.requestAnimationFrame(attempt);
+      };
+      win.requestAnimationFrame(attempt);
+    });
+  }
+
+  // Average colour balance of the petals in a box (fractions of the frame), leaving out green and black.
+  function balance(d, box = [0, 0, 1, 1]) {
+    let r = 0, g = 0, b = 0, n = 0;
+    const x0 = Math.floor(box[0] * THUMB_W), y0 = Math.floor(box[1] * THUMB_H);
+    const x1 = Math.ceil(box[2] * THUMB_W), y1 = Math.ceil(box[3] * THUMB_H);
+    for (let y = Math.max(y0, 0); y < Math.min(y1, THUMB_H); y++) for (let x = Math.max(x0, 0); x < Math.min(x1, THUMB_W); x++) {
+      const i = (y * THUMB_W + x) * 4, R = d[i], G = d[i + 1], B = d[i + 2], s = R + G + B;
+      if (s < 120 || (G > R * 1.05 && G > B * 1.05)) continue;
+      r += R / s; g += G / s; b += B / s; n++;
+    }
+    return n ? { r: r / n, g: g / n, b: b / n, n } : null;
+  }
+  const dist = (a, b) => (a && b ? Math.max(Math.abs(a.r - b.r), Math.abs(a.g - b.g), Math.abs(a.b - b.b)) : 0);
+
+  async function checkPage(name, stageEl) {
+    const r = { name, errors: [] };
+    const res = await fetch(`../flowers/${name}.html`, { cache: "no-store" }).catch(() => null);
+    if (!res) { r.http = 0; r.errors.push("could not load the page: is the server still running?"); return r; }
+    r.http = res.status;
+    const html = (await res.text()).replace("<head>", "<head>" + errorHook);
+    // for the lily test: where each head sits, as fractions of the 780 x 1300 scene
+    const heads = name === "lilies" ? [...html.matchAll(/\{ x: (\d+), y: (\d+), L: (\d+), c:/g)].map((m) => {
+      const [x, y, L] = [m[1] / 780, m[2] / 1300, m[3]];
+      return [x - (L * 0.45) / 780, y - (L * 0.45) / 1300, x + (L * 0.45) / 780, y + (L * 0.45) / 1300];
+    }) : null;
+
+    const frame = document.createElement("iframe");
+    frame.srcdoc = html;
+    stageEl.appendChild(frame);
+    await new Promise((res2) => { frame.onload = res2; });
+    let tries = 0;
+    while (!frame.contentDocument.querySelector("canvas") && tries++ < 150) await sleep(100);
+    if (!frame.contentDocument.querySelector("canvas")) {
+      r.errors.push("no canvas appeared"); r.errors.push(...(frame.contentWindow.__errors || [])); frame.remove(); return r;
+    }
+    const t0 = performance.now();
+    const now = () => (performance.now() - t0) / 1000;
+    // waits on animation frames, not timers: Chrome slows timers to once a second in a window without focus
+    const waitUntil = async (t) => { while (now() < t) await new Promise((r) => requestAnimationFrame(r)); };
+
+    await waitUntil(AT_BUD);
+    const bud = await grab(frame);
+    r.budLit = bud.lit;
+    r.budAt = now(); // if the page stalled while starting up, this sample came too late to be a bud
+    await waitUntil(AT_BLOOM);
+    const bloom = await grab(frame);
+    r.bloomLit = bloom.lit;
+
+    const series = [], headSeries = [], cellSeries = [];
+    let last = bloom, later = bloom, biggest = 0, closeSteps = 0, maxGap = 0, lastAt = now();
+    let bal = balance(bloom.data);
+    series.push(bal);
+    cellSeries.push(CELLS.map((b) => balance(bloom.data, b)));
+    if (heads) headSeries.push(heads.map((b) => balance(bloom.data, b)));
+    for (let t = AT_BLOOM + STEP; t <= END; t += STEP) {
+      await waitUntil(t);
+      last = await grab(frame);
+      const at = now(), gap = at - lastAt;
+      lastAt = at;
+      maxGap = Math.max(maxGap, gap);
+      const next = balance(last.data);
+      // smoothness is only judged between samples taken close together
+      if (gap <= 0.2) { biggest = Math.max(biggest, dist(bal, next)); closeSteps++; }
+      bal = next;
+      cellSeries.push(CELLS.map((b) => balance(last.data, b)));
+      series.push(next);
+      if (heads) headSeries.push(heads.map((b) => balance(last.data, b)));
+      if (t <= (AT_BLOOM + END) / 2) later = last;
+      t = Math.max(t, now() - STEP); // on a slow machine, skip samples instead of overrunning
+    }
+    let range = 0;
+    series.forEach((a) => series.forEach((b) => { range = Math.max(range, dist(a, b)); }));
+    r.colourRange = range; r.biggestStep = biggest; r.closeSteps = closeSteps; r.maxGap = maxGap;
+    // the largest change in any one part of the picture, ignoring nearly empty cells
+    r.localRange = Math.max(...CELLS.map((_, c) => {
+      const vals = cellSeries.map((s) => s[c]).filter((v) => v && v.n > 150);
+      if (vals.length < cellSeries.length * 0.9) return 0;
+      let m = 0;
+      vals.forEach((a) => vals.forEach((b) => { m = Math.max(m, dist(a, b)); }));
+      return m;
+    }));
+    if (heads) {
+      r.headsChanged = heads.filter((_, h) => {
+        let m = 0;
+        headSeries.forEach((a) => headSeries.forEach((b) => { m = Math.max(m, dist(a[h], b[h])); }));
+        return m > 0.02;
+      }).length;
+      // how different the lilies are from each other at the most uniform moment
+      r.minSpread = Math.min(...headSeries.map((s) => {
+        let m = 0;
+        s.forEach((a) => s.forEach((b) => { m = Math.max(m, dist(a, b)); }));
+        return m;
+      }));
+    }
+
+    const hasColour = name !== "sunflower";
+    r.thumbs = [bud.canvas, bloom.canvas, later.canvas, last.canvas];
+    r.errors.push(...frame.contentWindow.__errors);
+    r.hasColour = hasColour;
+    frame.remove();
+    return r;
+  }
+
+  const results = [];
+  const stage = document.getElementById("stage");
+  for (let i = 0; i < pages.length; i += BATCH) {
+    statusEl.textContent = `checking ${i + 1}-${Math.min(i + BATCH, pages.length)} of ${pages.length}: ${pages.slice(i, i + BATCH).join(", ")}`;
+    const batch = await Promise.all(pages.slice(i, i + BATCH).map((p) => checkPage(p, stage)));
+    results.push(...batch);
+  }
+
+  // The sunflower has no colour change, so its reading is what sway and character noise alone produce.
+  let control = results.find((r) => r.name === "sunflower");
+  const threshold = Math.max((control ? control.colourRange : 0) * 1.6, 0.012);
+  const localThreshold = Math.max((control ? control.localRange : 0) * 1.6, 0.025);
+
+  const verdict = (r) => {
+    const fails = [];
+    if (r.http !== 200) fails.push("http " + r.http);
+    if (r.errors.length) fails.push("errors: " + r.errors.join("; "));
+    if (r.budAt > 3) fails.push(`page stalled on start-up; bud sampled at ${r.budAt.toFixed(1)}s, run again`);
+    else if (!(r.bloomLit > r.budLit * 1.25)) fails.push("no visible growth");
+    if (r.bloomLit < 0.03) fails.push("barely anything drawn");
+    if (r.hasColour && !(r.colourRange > threshold || r.localRange > localThreshold)) fails.push("no colour change detected");
+    // A fade spreads over many samples. A flash would put most of the change into one.
+    if (r.hasColour && r.closeSteps < 20) fails.push(`frames too slow to judge smoothness (gaps up to ${r.maxGap.toFixed(2)}s)`);
+    else if (r.hasColour && r.biggestStep > Math.max(r.colourRange * 0.4, 0.03)) fails.push("abrupt colour jump");
+    if (r.name === "lilies") {
+      if (r.headsChanged < 5) fails.push(`only ${r.headsChanged} lilies changed colour`);
+      if (r.minSpread < 0.03) fails.push("bouquet went uniform");
+    }
+    return fails;
+  };
+  results.forEach((r) => { r.fails = verdict(r); });
+
+  // index.html: does it choose a real page and load it without error?
+  const index = document.createElement("iframe");
+  index.srcdoc = indexHtml.replace("<head>", `<head><base href="${new URL("../", location.href)}">` + errorHook);
+  stage.appendChild(index);
+  await new Promise((res) => { index.onload = res; });
+  await sleep(800);
+  const inner = index.contentDocument.getElementById("flower");
+  const indexSrc = inner.getAttribute("src");
+  const indexOk = allPages.some((p) => indexSrc === `flowers/${p}.html`) && !index.contentWindow.__errors.length;
+  index.remove();
+
+  const fmt = (x) => (x === undefined ? "" : x.toFixed(3));
+  const table = document.getElementById("table");
+  table.innerHTML = "<tr><th>flower</th><th>result</th><th>bud lit</th><th>bloom lit</th><th>colour range</th><th>in one area</th><th>largest 0.1s step</th><th>slowest gap</th><th>detail</th></tr>";
+  results.forEach((r) => {
+    const row = table.insertRow();
+    const extra = r.name === "lilies" ? ` ${r.headsChanged}/10 lilies changed, least spread ${fmt(r.minSpread)}` : r.name === "sunflower" ? " (control)" : "";
+    row.innerHTML = `<td>${r.name}</td><td class="${r.fails.length ? "fail" : "pass"}">${r.fails.length ? "FAIL" : "pass"}</td>
+      <td>${fmt(r.budLit)}</td><td>${fmt(r.bloomLit)}</td><td>${fmt(r.colourRange)}</td><td>${fmt(r.localRange)}</td><td>${fmt(r.biggestStep)}</td><td>${fmt(r.maxGap)}</td><td>${r.fails.join(", ")}${extra}</td>`;
+  });
+  const row = table.insertRow();
+  row.innerHTML = `<td>index.html</td><td class="${indexOk ? "pass" : "fail"}">${indexOk ? "pass" : "FAIL"}</td><td colspan="7">today: ${indexSrc}</td>`;
+
+  const sheet = document.getElementById("sheet");
+  results.forEach((r) => (r.thumbs || []).forEach((c, i) => {
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    cap.textContent = `${r.name} ${["bud", "bloom", "mid", "end"][i]}`;
+    fig.append(cap, c);
+    sheet.append(fig);
+  }));
+
+  const failed = results.filter((r) => r.fails.length).length + (indexOk ? 0 : 1);
+  statusEl.textContent = `done: ${results.length} flowers, ${failed} failed. colour thresholds ${threshold.toFixed(3)} overall, ${localThreshold.toFixed(3)} in one area`;
+  statusEl.className = failed ? "fail" : "pass";
+  window.results = { done: true, failed, threshold, localThreshold, indexSrc, indexOk, flowers: results.map(({ thumbs, ...rest }) => rest) };
+})();
+</script>
+</body>
+</html>

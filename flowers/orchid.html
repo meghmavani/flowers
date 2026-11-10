@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASCII Moth Orchid</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; justify-content: center; align-items: center; }
+  canvas { height: 100vh !important; width: auto !important; max-width: 100vw; object-fit: contain; }
+  #hint { position: fixed; bottom: 10px; left: 0; right: 0; text-align: center;
+          font: 12px monospace; color: #ffffff55; pointer-events: none; }
+  #magic { position: fixed; top: 14px; left: 16px; right: 16px; text-align: center;
+           font: 14px monospace; color: #ffffffcc; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="magic">click or press r again for some magic</div>
+<div id="hint">click or press R to replay the bloom</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
+<script>
+(async () => {
+  /* ---------- config ---------- */
+  const COLS = 130, ROWS = 130;     // ascii grid
+  const CW = 6, CH = 10;            // pixel size of one character cell
+  const SS = 2;                     // supersampling per cell (SS x SS pixels averaged)
+  const W = COLS * CW, H = ROWS * CH; // virtual scene size (matches screen space)
+  const RAMP = ".,:;-~=+*#%@";
+  const BASE = { x: 390, y: 1235 };
+
+  /* ---------- display app (shows the ascii canvas) ---------- */
+  const app = new PIXI.Application();
+  await app.init({
+    width: W, height: H, background: 0x000000,
+    antialias: false, resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true,
+  });
+  document.body.appendChild(app.canvas);
+
+  /* ---------- offscreen vector scene ---------- */
+  const rt = PIXI.RenderTexture.create({ width: COLS * SS, height: ROWS * SS });
+  const scene = new PIXI.Container();
+  const world = new PIXI.Container();
+  world.scale.set((COLS * SS) / W, (ROWS * SS) / H);
+  scene.addChild(world);
+
+  const grassLayer = new PIXI.Container();
+  const stemLayer = new PIXI.Container();
+  const leafLayer = new PIXI.Container();
+  const flowerLayer = new PIXI.Container();
+  world.addChild(grassLayer, stemLayer, leafLayer, flowerLayer);
+
+  /* ---------- helpers ---------- */
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = (t) => { const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const deg = Math.PI / 180;
+  const normAngle = (a) => ((((a + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
+
+  /* ---------- petal / leaf shapes ---------- */
+  // Petals are drawn in white and coloured with tint, so a flower can change
+  // colour every frame without redrawing. role: index into [main, light, dark].
+  // wave (0..1) holds a part back during a colour change, so that the new colour
+  // travels across the flower instead of arriving everywhere at once.
+  const addPart = (parts, g, role, shade = 1, wave = 0) => { g.role = role; g.shade = shade; g.wave = wave; parts.push(g); return g; };
+
+  // adds one rounded petal to g, pointing along angle a
+  function rotPetal(g, a, R, w, cx = 0, cy = 0) {
+    const c = Math.cos(a), s = Math.sin(a);
+    const X = (x, y) => cx + x * c - y * s, Y = (x, y) => cy + x * s + y * c;
+    g.moveTo(cx, cy)
+      .bezierCurveTo(X(w, -R * 0.25), Y(w, -R * 0.25), X(w * 1.05, -R * 0.95), Y(w * 1.05, -R * 0.95), X(0, -R), Y(0, -R))
+      .bezierCurveTo(X(-w * 1.05, -R * 0.95), Y(-w * 1.05, -R * 0.95), X(-w, -R * 0.25), Y(-w, -R * 0.25), cx, cy);
+    return g;
+  }
+
+  // a point on the stem, moved sideways by lat
+  const offStem = (f, t, lat) => {
+    const q = bez(f, t), a = bezAngle(f, t);
+    return { x: q.x + Math.cos(a) * lat, y: q.y + Math.sin(a) * lat };
+  };
+
+  // the moth shape: three narrow sepals behind two very broad, round petals, and a patterned lip
+  function makeMoth(S, shade, parts, wave) {
+    const c = new PIXI.Container();
+    const sepals = new PIXI.Graphics();
+    [0, 128, -128].forEach((a) => rotPetal(sepals, a * deg, S * 0.98, S * 0.3).fill({ color: 0xffffff }));
+    addPart(parts, sepals, 0, shade * 0.86, wave);
+    const petals = new PIXI.Graphics();
+    [-74, 74].forEach((a) => rotPetal(petals, a * deg, S * 1.04, S * 0.66).fill({ color: 0xffffff }));
+    addPart(parts, petals, 0, shade, wave);
+    const sheen = new PIXI.Graphics();
+    [-74, 74].forEach((a) => rotPetal(sheen, a * deg, S * 0.8, S * 0.3).fill({ color: 0xffffff, alpha: 0.6 }));
+    addPart(parts, sheen, 1, 1, wave);
+    const lip = new PIXI.Graphics();
+    rotPetal(lip, 180 * deg, S * 0.56, S * 0.22, 0, S * 0.05).fill({ color: 0xffffff });
+    rotPetal(lip, 122 * deg, S * 0.36, S * 0.17, 0, S * 0.08).fill({ color: 0xffffff });
+    rotPetal(lip, -122 * deg, S * 0.36, S * 0.17, 0, S * 0.08).fill({ color: 0xffffff });
+    addPart(parts, lip, 2, 1, wave);
+    const throat = new PIXI.Graphics()
+      .circle(0, S * 0.14, S * 0.11).fill({ color: 0xf0c020 })
+      .ellipse(0, -S * 0.02, S * 0.1, S * 0.14).fill({ color: 0xfff6e8 });
+    c.addChild(sepals, petals, sheen, lip, throat);
+    return c;
+  }
+
+  function makeOrchidBud(S, shade, parts, wave) {
+    const g = new PIXI.Graphics().ellipse(0, 0, S * 0.4, S * 0.5).fill({ color: 0xffffff });
+    addPart(parts, g, 0, shade * 0.86, wave);
+    return g;
+  }
+
+  function makeLeaf(len, wide = 0.17, color = 0x2f9a35, vein = 0xb6f08a) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(len * wide, -len * 0.3, len * wide * 0.76, -len * 0.75, 0, -len)
+      .bezierCurveTo(-len * wide * 0.76, -len * 0.75, -len * wide, -len * 0.3, 0, 0)
+      .fill({ color });
+    g.moveTo(0, -len * 0.05).lineTo(0, -len * 0.9).stroke({ width: 2.5, color: vein, alpha: 0.7 });
+    return g;
+  }
+
+  /* ---------- bouquet definition ---------- */
+  //  x,y = tip of the arching spike, n = blooms, s = size of the largest bloom, d = start delay (s)
+  const DEFS = [
+  { x: 690, y: 215, n: 7, s: 95, d: 0.5 },
+  { x: 85, y: 480, n: 5, s: 78, d: 0 },
+  ];
+
+  // Moth orchid colours. "dark" colours the lip, which stays deeper than the petals.
+  // [main, light, dark]
+  const PALETTE = [
+    [0xf4f2ee, 0xffffff, 0xc04a8a], // white
+    [0xf0a0c8, 0xffd6ea, 0xa81868], // pink
+    [0xc83a98, 0xf28acb, 0x6a0a50], // magenta
+    [0xf4e6a0, 0xfff6cc, 0xb04a20], // pale yellow
+    [0xc8a8e8, 0xe8d8ff, 0x6a2fa0], // lilac
+  ];
+
+  const STEM_TIME = 2.2, BLOOM_DELAY = 1.9, BLOOM_TIME = 2.6;
+  // Colour changes begin once everything has opened. Only one flower changes at
+  // a time: it fades for FADE_TIME, then HOLD_TIME passes before the next starts.
+  const FIRST_CHANGE = Math.max(...DEFS.map((d) => d.d)) + BLOOM_DELAY + BLOOM_TIME + 0.4;
+  const FADE_TIME = 3.8, HOLD_TIME = 1, WAVE = 0.6, PULSE = 0.04;
+  let flowers = [];
+  let changing = null, nextChangeAt = FIRST_CHANGE, queue = [], lastChanged = null;
+  let deck = [], lastDealt = -1;
+
+  const shuffled = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  // deal the palette out evenly, so a replay opens on different colours
+  const dealColor = () => {
+    if (!deck.length) {
+      deck = shuffled(PALETTE.map((_, i) => i));
+      if (deck[deck.length - 1] === lastDealt) deck.unshift(deck.pop());
+    }
+    lastDealt = deck.pop();
+    return lastDealt;
+  };
+
+  // shade 0..1 darkens the colour, mix blends between two colours
+  const mixColor = (a, b, m, shade = 1) => {
+    const ch = (s) => Math.round(lerp((a >> s) & 255, (b >> s) & 255, m) * shade);
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+  };
+
+  function paintFlower(f, m) {
+    const from = PALETTE[f.colorFrom], to = PALETTE[f.colorTo];
+    f.parts.forEach((part) => {
+      const local = clamp01(m * (1 + WAVE) - part.wave * WAVE);
+      part.tint = mixColor(from[part.role], to[part.role], local, part.shade);
+    });
+  }
+
+  // Every flower gets a turn before any repeats, and it takes whichever colour
+  // the bunch has least of, so the bunch never ends up all one colour.
+  function startNextChange(t) {
+    if (!queue.length) {
+      queue = shuffled(flowers);
+      if (queue[queue.length - 1] === lastChanged) queue.unshift(queue.pop());
+    }
+    const f = queue.pop();
+    const counts = PALETTE.map((_, i) => flowers.filter((o) => o.colorTo === i).length);
+    const choices = PALETTE.map((_, i) => i).filter((i) => i !== f.colorTo);
+    const fewest = Math.min(...choices.map((i) => counts[i]));
+    const options = choices.filter((i) => counts[i] === fewest);
+    f.colorFrom = f.colorTo;
+    f.colorTo = options[Math.floor(Math.random() * options.length)];
+    changing = { f, start: t };
+    lastChanged = f;
+  }
+
+  function updateColors(t) {
+    if (!changing && t >= nextChangeAt) startNextChange(t);
+    if (!changing) return;
+    const raw = clamp01((t - changing.start) / FADE_TIME);
+    paintFlower(changing.f, easeInOut(raw));
+    changing.f.pulse = Math.sin(raw * Math.PI) * PULSE; // small swell as it turns
+    if (raw >= 1) {
+      changing.f.pulse = 0;
+      changing = null;
+      nextChangeAt = t + HOLD_TIME;
+    }
+  }
+
+  function buildScene() {
+    [grassLayer, stemLayer, leafLayer, flowerLayer].forEach((l) => l.removeChildren().forEach((c) => c.destroy({ children: true })));
+    flowers = [];
+    changing = null; nextChangeAt = FIRST_CHANGE; queue = []; lastChanged = null;
+
+    // thick strap leaves that spread out low from the crown
+    [[-76, 330], [78, 345], [-52, 300], [50, 280], [-16, 210], [18, 200]].forEach(([rot, len], i) => {
+      const b = makeLeaf(len, 0.25, 0x2d8a3a, 0x9ee090);
+      b.x = BASE.x + rnd(-14, 14); b.y = BASE.y + 10;
+      b.baseRot = rot * deg;
+      b.delay = i * 0.1;
+      b.scale.set(0);
+      grassLayer.addChild(b);
+    });
+
+    // draw back-to-front: top flowers first
+    const sorted = [...DEFS].sort((a, b) => a.y - b.y);
+    sorted.forEach((def) => {
+      const sx = BASE.x + rnd(-28, 28), sy = BASE.y;
+      const ctrl = { x: lerp(sx, def.x, 0.08), y: def.y - 130 };
+      const stemG = new PIXI.Graphics();
+      stemLayer.addChild(stemG);
+
+      const leaves = [];
+      const parts = [];
+
+      const blooms = [];
+      for (let i = 0; i < def.n; i++) {
+        const u = i / (def.n - 1);
+        const isBud = i >= def.n - 2;
+        const size = def.s * lerp(1, 0.68, u);
+        const c = isBud ? makeOrchidBud(size * 0.6, 1, parts, u) : makeMoth(size, 1, parts, u);
+        c.t = lerp(0.5, 1, Math.pow(u, 0.85));
+        c.u = u;
+        c.lat = i % 2 ? size * 0.5 : -size * 0.5;
+        c.baseRot = isBud ? 0 : rnd(-0.14, 0.14);
+        c.visible = false;
+        flowerLayer.addChild(c);
+        blooms.push(c);
+      }
+      const extra = { blooms };
+
+      const color = dealColor();
+      const f = {
+        def, sx, sy, ctrl, stemG, leaves, parts,
+        colorFrom: color, colorTo: color, pulse: 0,
+        swayPhase: rnd(0, 6.28), ...extra,
+      };
+      paintFlower(f, 1);
+      flowers.push(f);
+    });
+  }
+
+  const bez = (f, t) => {
+    const u = 1 - t;
+    return {
+      x: u * u * f.sx + 2 * u * t * f.ctrl.x + t * t * f.def.x,
+      y: u * u * f.sy + 2 * u * t * f.ctrl.y + t * t * f.def.y,
+    };
+  };
+  const bezAngle = (f, t) => {
+    const u = 1 - t;
+    const dx = 2 * u * (f.ctrl.x - f.sx) + 2 * t * (f.def.x - f.ctrl.x);
+    const dy = 2 * u * (f.ctrl.y - f.sy) + 2 * t * (f.def.y - f.ctrl.y);
+    return Math.atan2(dx, -dy); // 0 = pointing up
+  };
+
+  /* ---------- per-frame scene update ---------- */
+  function updateScene(t) {
+    grassLayer.children.forEach((b) => {
+      const g = easeOutCubic(clamp01((t - b.delay) / 1.4));
+      b.scale.set(g * 0.9, g);
+      b.rotation = b.baseRot + Math.sin(t * 1.1 + b.x) * 0.03 * g;
+    });
+
+    flowers.forEach((f) => {
+      const local = t - f.def.d;
+      const p = easeInOut(clamp01(local / STEM_TIME));
+      const o = easeOutBack(clamp01((local - BLOOM_DELAY) / BLOOM_TIME));
+      const oc = clamp01(o);
+      const sway = Math.sin(t * 1.3 + f.swayPhase) * 0.02;
+
+      // stem: polyline up to p
+      f.stemG.clear();
+      if (p > 0.001) {
+        const N = 28, n = Math.max(2, Math.ceil(N * p));
+        const pts = [];
+        for (let i = 0; i <= n; i++) pts.push(bez(f, (i / n) * p));
+        f.stemG.moveTo(pts[0].x, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x, q.y));
+        f.stemG.stroke({ width: 7, color: 0x5a7a3a, cap: "round", join: "round" });
+        f.stemG.moveTo(pts[0].x - 2, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x - 2, q.y));
+        f.stemG.stroke({ width: 3, color: 0xa0c070, alpha: 0.7, cap: "round", join: "round" });
+      }
+
+      // leaves
+      f.leaves.forEach((lf) => {
+        const g = easeOutCubic(clamp01((p - lf.t) / 0.25));
+        const q = bez(f, lf.t);
+        lf.x = q.x; lf.y = q.y;
+        lf.rotation = bezAngle(f, lf.t) + lf.side * lf.ang * deg + sway * 2;
+        lf.scale.set(g);
+      });
+
+      // the blooms nearest the plant open first, the buds at the tip stay closed
+      f.blooms.forEach((c) => {
+        c.visible = p > c.t;
+        const q = offStem(f, c.t, c.lat);
+        c.x = q.x; c.y = q.y;
+        c.scale.set(lerp(0.18, 1, easeOutBack(clamp01((oc * 1.5 - c.u * 0.8) / 0.7))));
+        c.rotation = c.baseRot + sway;
+      });
+    });
+  }
+
+  /* ---------- ascii canvas ---------- */
+  const ascii = document.createElement("canvas");
+  ascii.width = W; ascii.height = H;
+  const ctx = ascii.getContext("2d");
+  ctx.textBaseline = "top";
+  ctx.font = `bold ${CH}px "SF Mono", Menlo, Consolas, monospace`;
+  const sprite = new PIXI.Sprite(PIXI.Texture.from(ascii));
+  app.stage.addChild(sprite);
+
+  const stars = [...Array(90)].map(() => ({
+    c: Math.floor(rnd(0, COLS)), r: Math.floor(rnd(0, ROWS)), ph: rnd(0, 6.28), sp: rnd(0.8, 2.4),
+  }));
+
+  function readPixels() {
+    const res = app.renderer.extract.pixels({ target: rt });
+    return res && res.pixels ? res : { pixels: res, width: rt.width, height: rt.height };
+  }
+
+  function drawAscii(t) {
+    app.renderer.render({ container: scene, target: rt, clear: true, clearColor: [0, 0, 0, 1] });
+    const { pixels, width: pw } = readPixels();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // twinkling background stars
+    ctx.font = `${CH}px "SF Mono", Menlo, Consolas, monospace`;
+    stars.forEach((s) => {
+      const a = 0.15 + 0.35 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+      ctx.fillText(".", s.c * CW, s.r * CH);
+    });
+
+    ctx.font = `bold ${CH + 1}px "SF Mono", Menlo, Consolas, monospace`;
+    const inv = 1 / (SS * SS);
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        let R = 0, G = 0, B = 0;
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const i = ((r * SS + sy) * pw + (c * SS + sx)) * 4;
+            R += pixels[i]; G += pixels[i + 1]; B += pixels[i + 2];
+          }
+        }
+        R *= inv; G *= inv; B *= inv;
+        const lum = 0.299 * R + 0.587 * G + 0.114 * B;
+        if (lum < 14) continue;
+        let idx = Math.round(clamp01(lum / 215) * (RAMP.length - 1));
+        const j = Math.random();
+        if (j < 0.08) idx = Math.max(0, idx - 1); else if (j > 0.94) idx = Math.min(RAMP.length - 1, idx + 1);
+        const k = 1.25;
+        ctx.fillStyle = `rgb(${Math.min(255, R * k) | 0},${Math.min(255, G * k) | 0},${Math.min(255, B * k) | 0})`;
+        ctx.fillText(RAMP[idx], c * CW, r * CH);
+      }
+    }
+    sprite.texture.source.update();
+  }
+
+  /* ---------- run / replay ---------- */
+  let t0 = performance.now();
+  function replay() { buildScene(); t0 = performance.now(); }
+  buildScene();
+
+  app.ticker.add(() => {
+    const t = (performance.now() - t0) / 1000;
+    updateColors(t);
+    updateScene(t);
+    drawAscii(t);
+  });
+
+  window.addEventListener("keydown", (e) => { if (e.key.toLowerCase() === "r") replay(); });
+  window.addEventListener("pointerdown", replay);
+})();
+</script>
+</body>
+</html>

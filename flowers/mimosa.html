@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ASCII Mimosa</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; justify-content: center; align-items: center; }
+  canvas { height: 100vh !important; width: auto !important; max-width: 100vw; object-fit: contain; }
+  #hint { position: fixed; bottom: 10px; left: 0; right: 0; text-align: center;
+          font: 12px monospace; color: #ffffff55; pointer-events: none; }
+  #magic { position: fixed; top: 14px; left: 16px; right: 16px; text-align: center;
+           font: 14px monospace; color: #ffffffcc; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="magic">click or press r again for some magic</div>
+<div id="hint">click or press R to replay the bloom</div>
+
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
+<script>
+(async () => {
+  /* ---------- config ---------- */
+  const COLS = 130, ROWS = 130;     // ascii grid
+  const CW = 6, CH = 10;            // pixel size of one character cell
+  const SS = 2;                     // supersampling per cell (SS x SS pixels averaged)
+  const W = COLS * CW, H = ROWS * CH; // virtual scene size (matches screen space)
+  const RAMP = ".,:;-~=+*#%@";
+  const BASE = { x: 390, y: 1235 };
+
+  /* ---------- display app (shows the ascii canvas) ---------- */
+  const app = new PIXI.Application();
+  await app.init({
+    width: W, height: H, background: 0x000000,
+    antialias: false, resolution: Math.min(window.devicePixelRatio || 1, 2), autoDensity: true,
+  });
+  document.body.appendChild(app.canvas);
+
+  /* ---------- offscreen vector scene ---------- */
+  const rt = PIXI.RenderTexture.create({ width: COLS * SS, height: ROWS * SS });
+  const scene = new PIXI.Container();
+  const world = new PIXI.Container();
+  world.scale.set((COLS * SS) / W, (ROWS * SS) / H);
+  scene.addChild(world);
+
+  const grassLayer = new PIXI.Container();
+  const stemLayer = new PIXI.Container();
+  const leafLayer = new PIXI.Container();
+  const flowerLayer = new PIXI.Container();
+  world.addChild(grassLayer, stemLayer, leafLayer, flowerLayer);
+
+  /* ---------- helpers ---------- */
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = (t) => { const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const deg = Math.PI / 180;
+  const normAngle = (a) => ((((a + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
+
+  /* ---------- petal / leaf shapes ---------- */
+  // Petals are drawn in white and coloured with tint, so a flower can change
+  // colour every frame without redrawing. role: index into [main, light, dark].
+  // wave (0..1) holds a part back during a colour change, so that the new colour
+  // travels across the flower instead of arriving everywhere at once.
+  const addPart = (parts, g, role, shade = 1, wave = 0) => { g.role = role; g.shade = shade; g.wave = wave; parts.push(g); return g; };
+
+  // a fuzzy golden ball: a dense dot with stamens sticking out in every direction
+  function makePuff(r, shade, parts, wave) {
+    const c = new PIXI.Container();
+    const fuzz = new PIXI.Graphics();
+    for (let i = 0; i < 16; i++) {
+      const a = i * 137.5 * deg;
+      fuzz.moveTo(0, 0).lineTo(Math.cos(a) * r * 1.35, Math.sin(a) * r * 1.35);
+    }
+    fuzz.stroke({ width: 3, color: 0xffffff, alpha: 0.9 });
+    addPart(parts, fuzz, 0, shade, wave);
+    const ball = new PIXI.Graphics().circle(0, 0, r).fill({ color: 0xffffff });
+    addPart(parts, ball, 0, shade, wave);
+    const lit = new PIXI.Graphics().circle(-r * 0.28, -r * 0.28, r * 0.48).fill({ color: 0xffffff, alpha: 0.8 });
+    addPart(parts, lit, 1, 1, wave);
+    c.addChild(fuzz, ball, lit);
+    return c;
+  }
+
+  // the silvery, fern-like leaf: leaflets of leaflets
+  function makeFernLeaf(len) {
+    const g = new PIXI.Graphics();
+    const color = 0xa4dcb8;
+    g.moveTo(0, 0).lineTo(0, -len).stroke({ width: 5, color });
+    for (let i = 1; i <= 8; i++) {
+      const u = i / 9, y = -len * u, s = len * 0.3 * Math.sin(u * 2.9 + 0.1);
+      [1, -1].forEach((side) => {
+        const ex = side * s, ey = y - s * 0.55;
+        g.moveTo(0, y).lineTo(ex, ey).stroke({ width: 4, color });
+        for (let j = 1; j <= 3; j++) {
+          const v = j / 4, x = ex * v, yy = y + (ey - y) * v, tick = s * 0.22;
+          g.moveTo(x, yy).lineTo(x + side * tick * 0.3, yy - tick).stroke({ width: 2, color });
+        }
+      });
+    }
+    return g;
+  }
+
+  function makeLeaf(len, wide = 0.17, color = 0x2f9a35, vein = 0xb6f08a) {
+    const g = new PIXI.Graphics();
+    g.moveTo(0, 0)
+      .bezierCurveTo(len * wide, -len * 0.3, len * wide * 0.76, -len * 0.75, 0, -len)
+      .bezierCurveTo(-len * wide * 0.76, -len * 0.75, -len * wide, -len * 0.3, 0, 0)
+      .fill({ color });
+    g.moveTo(0, -len * 0.05).lineTo(0, -len * 0.9).stroke({ width: 2.5, color: vein, alpha: 0.7 });
+    return g;
+  }
+
+  /* ---------- bouquet definition ---------- */
+  //  x,y = tip of the arching branch, s = size of the puffs, d = start delay (s)
+  const DEFS = [
+  { x: 400, y: 95, s: 19, d: 0.5 },
+  { x: 95, y: 340, s: 17, d: 0 },
+  { x: 690, y: 300, s: 17, d: 0.9 },
+  ];
+
+  // Mimosa is always yellow, so it only moves between lemon, gold and deep yolk.
+  // [main, light, dark]
+  const PALETTE = [
+    [0xf7c615, 0xffe85a, 0xb88a05], // golden
+    [0xf8e35a, 0xfff6a8, 0xb8a02a], // lemon
+    [0xf2a80e, 0xffd24a, 0xa96a04], // yolk
+  ];
+
+  const STEM_TIME = 2.2, BLOOM_DELAY = 1.9, BLOOM_TIME = 2.6;
+  // Colour changes begin once everything has opened. Only one flower changes at
+  // a time: it fades for FADE_TIME, then HOLD_TIME passes before the next starts.
+  const FIRST_CHANGE = Math.max(...DEFS.map((d) => d.d)) + BLOOM_DELAY + BLOOM_TIME + 0.4;
+  const FADE_TIME = 3.2, HOLD_TIME = 0.6, WAVE = 1, PULSE = 0.04;
+  let flowers = [];
+  let changing = null, nextChangeAt = FIRST_CHANGE, queue = [], lastChanged = null;
+  let deck = [], lastDealt = -1;
+
+  const shuffled = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  // deal the palette out evenly, so a replay opens on different colours
+  const dealColor = () => {
+    if (!deck.length) {
+      deck = shuffled(PALETTE.map((_, i) => i));
+      if (deck[deck.length - 1] === lastDealt) deck.unshift(deck.pop());
+    }
+    lastDealt = deck.pop();
+    return lastDealt;
+  };
+
+  // shade 0..1 darkens the colour, mix blends between two colours
+  const mixColor = (a, b, m, shade = 1) => {
+    const ch = (s) => Math.round(lerp((a >> s) & 255, (b >> s) & 255, m) * shade);
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+  };
+
+  function paintFlower(f, m) {
+    const from = PALETTE[f.colorFrom], to = PALETTE[f.colorTo];
+    f.parts.forEach((part) => {
+      const local = clamp01(m * (1 + WAVE) - part.wave * WAVE);
+      part.tint = mixColor(from[part.role], to[part.role], local, part.shade);
+    });
+  }
+
+  // Every flower gets a turn before any repeats, and it takes whichever colour
+  // the bunch has least of, so the bunch never ends up all one colour.
+  function startNextChange(t) {
+    if (!queue.length) {
+      queue = shuffled(flowers);
+      if (queue[queue.length - 1] === lastChanged) queue.unshift(queue.pop());
+    }
+    const f = queue.pop();
+    const counts = PALETTE.map((_, i) => flowers.filter((o) => o.colorTo === i).length);
+    const choices = PALETTE.map((_, i) => i).filter((i) => i !== f.colorTo);
+    const fewest = Math.min(...choices.map((i) => counts[i]));
+    const options = choices.filter((i) => counts[i] === fewest);
+    f.colorFrom = f.colorTo;
+    f.colorTo = options[Math.floor(Math.random() * options.length)];
+    changing = { f, start: t };
+    lastChanged = f;
+  }
+
+  function updateColors(t) {
+    if (!changing && t >= nextChangeAt) startNextChange(t);
+    if (!changing) return;
+    const raw = clamp01((t - changing.start) / FADE_TIME);
+    paintFlower(changing.f, easeInOut(raw));
+    changing.f.pulse = Math.sin(raw * Math.PI) * PULSE; // small swell as it turns
+    if (raw >= 1) {
+      changing.f.pulse = 0;
+      changing = null;
+      nextChangeAt = t + HOLD_TIME;
+    }
+  }
+
+  function buildScene() {
+    [grassLayer, stemLayer, leafLayer, flowerLayer].forEach((l) => l.removeChildren().forEach((c) => c.destroy({ children: true })));
+    flowers = [];
+    changing = null; nextChangeAt = FIRST_CHANGE; queue = []; lastChanged = null;
+
+    // draw back-to-front: top flowers first
+    const sorted = [...DEFS].sort((a, b) => a.y - b.y);
+    sorted.forEach((def) => {
+      const sx = BASE.x + rnd(-28, 28), sy = BASE.y;
+      const ctrl = { x: lerp(sx, def.x, 0.42), y: lerp(sy, def.y, 0.72) };
+      const stemG = new PIXI.Graphics();
+      stemLayer.addChild(stemG);
+
+      const firstSide = Math.random() < 0.5 ? 1 : -1;
+      const leaves = [];
+      [0.16, 0.27, 0.38, 0.5].forEach((t, i) => {
+        [i % 2 ? -firstSide : firstSide].forEach((side) => {
+          const lf = makeFernLeaf(rnd(135, 185));
+          lf.t = t; lf.side = side; lf.ang = 62;
+          lf.scale.set(0);
+          leafLayer.addChild(lf);
+          leaves.push(lf);
+        });
+      });
+      const parts = [];
+
+      // side twigs along the branch, each carrying a run of puffs
+      const twigs = [], puffs = [];
+      const TWIGS = 11;
+      for (let i = 0; i < TWIGS; i++) {
+        const u = i / (TWIGS - 1);
+        const side = i % 2 ? 1 : -1;
+        const len = lerp(150, 70, u) * rnd(0.85, 1.1);
+        const twig = { t: lerp(0.5, 0.99, u), side, len, ang: side * rnd(0.6, 1.0), u };
+        twigs.push(twig);
+        const count = Math.round(lerp(5, 3, u));
+        for (let k = 0; k < count; k++) {
+          const v = (k + 1) / count;
+          const puff = makePuff(def.s * rnd(0.82, 1.05), rnd(0.86, 1), parts, u);
+          puff.twig = twig; puff.v = v; puff.off = (k % 2 ? 1 : -1) * def.s * 0.9;
+          puff.scale.set(0);
+          flowerLayer.addChild(puff);
+          puffs.push(puff);
+        }
+      }
+      const twigG = new PIXI.Graphics();
+      stemLayer.addChild(twigG);
+      const extra = { twigs, puffs, twigG };
+
+      const color = dealColor();
+      const f = {
+        def, sx, sy, ctrl, stemG, leaves, parts,
+        colorFrom: color, colorTo: color, pulse: 0,
+        swayPhase: rnd(0, 6.28), ...extra,
+      };
+      paintFlower(f, 1);
+      flowers.push(f);
+    });
+  }
+
+  const bez = (f, t) => {
+    const u = 1 - t;
+    return {
+      x: u * u * f.sx + 2 * u * t * f.ctrl.x + t * t * f.def.x,
+      y: u * u * f.sy + 2 * u * t * f.ctrl.y + t * t * f.def.y,
+    };
+  };
+  const bezAngle = (f, t) => {
+    const u = 1 - t;
+    const dx = 2 * u * (f.ctrl.x - f.sx) + 2 * t * (f.def.x - f.ctrl.x);
+    const dy = 2 * u * (f.ctrl.y - f.sy) + 2 * t * (f.def.y - f.ctrl.y);
+    return Math.atan2(dx, -dy); // 0 = pointing up
+  };
+
+  /* ---------- per-frame scene update ---------- */
+  function updateScene(t) {
+    flowers.forEach((f) => {
+      const local = t - f.def.d;
+      const p = easeInOut(clamp01(local / STEM_TIME));
+      const o = easeOutBack(clamp01((local - BLOOM_DELAY) / BLOOM_TIME));
+      const oc = clamp01(o);
+      const sway = Math.sin(t * 1.3 + f.swayPhase) * 0.02;
+
+      // stem: polyline up to p
+      f.stemG.clear();
+      if (p > 0.001) {
+        const N = 28, n = Math.max(2, Math.ceil(N * p));
+        const pts = [];
+        for (let i = 0; i <= n; i++) pts.push(bez(f, (i / n) * p));
+        f.stemG.moveTo(pts[0].x, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x, q.y));
+        f.stemG.stroke({ width: 7, color: 0x6a8a48, cap: "round", join: "round" });
+        f.stemG.moveTo(pts[0].x - 2, pts[0].y);
+        pts.forEach((q) => f.stemG.lineTo(q.x - 2, q.y));
+        f.stemG.stroke({ width: 3, color: 0xb0d088, alpha: 0.7, cap: "round", join: "round" });
+      }
+
+      // leaves
+      f.leaves.forEach((lf) => {
+        const g = easeOutCubic(clamp01((p - lf.t) / 0.25));
+        const q = bez(f, lf.t);
+        lf.x = q.x; lf.y = q.y;
+        lf.rotation = bezAngle(f, lf.t) + lf.side * lf.ang * deg + sway * 2;
+        lf.scale.set(g);
+      });
+
+      // twigs grow from the branch, then the puffs swell from the base outward
+      const twigEnd = (tw, s) => {
+        const q = bez(f, tw.t), a = bezAngle(f, tw.t) + tw.ang + sway;
+        return { x: q.x + Math.sin(a) * tw.len * s, y: q.y - Math.cos(a) * tw.len * s, a };
+      };
+      f.twigG.clear();
+      f.twigs.forEach((tw) => {
+        if (p <= tw.t) return;
+        const q = bez(f, tw.t), e = twigEnd(tw, clamp01((p - tw.t) / 0.15));
+        f.twigG.moveTo(q.x, q.y).lineTo(e.x, e.y);
+      });
+      f.twigG.stroke({ width: 3.5, color: 0x8aa860, cap: "round" });
+      f.puffs.forEach((puff) => {
+        const tw = puff.twig;
+        const e = twigEnd(tw, puff.v);
+        puff.visible = p > tw.t;
+        puff.x = e.x + Math.cos(e.a) * puff.off;
+        puff.y = e.y + Math.sin(e.a) * puff.off;
+        puff.scale.set(lerp(0.2, 1, easeOutBack(clamp01((oc * 1.5 - tw.u * 0.7 - puff.v * 0.1) / 0.7))));
+      });
+    });
+  }
+
+  /* ---------- ascii canvas ---------- */
+  const ascii = document.createElement("canvas");
+  ascii.width = W; ascii.height = H;
+  const ctx = ascii.getContext("2d");
+  ctx.textBaseline = "top";
+  ctx.font = `bold ${CH}px "SF Mono", Menlo, Consolas, monospace`;
+  const sprite = new PIXI.Sprite(PIXI.Texture.from(ascii));
+  app.stage.addChild(sprite);
+
+  const stars = [...Array(90)].map(() => ({
+    c: Math.floor(rnd(0, COLS)), r: Math.floor(rnd(0, ROWS)), ph: rnd(0, 6.28), sp: rnd(0.8, 2.4),
+  }));
+
+  function readPixels() {
+    const res = app.renderer.extract.pixels({ target: rt });
+    return res && res.pixels ? res : { pixels: res, width: rt.width, height: rt.height };
+  }
+
+  function drawAscii(t) {
+    app.renderer.render({ container: scene, target: rt, clear: true, clearColor: [0, 0, 0, 1] });
+    const { pixels, width: pw } = readPixels();
+
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    // twinkling background stars
+    ctx.font = `${CH}px "SF Mono", Menlo, Consolas, monospace`;
+    stars.forEach((s) => {
+      const a = 0.15 + 0.35 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph));
+      ctx.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+      ctx.fillText(".", s.c * CW, s.r * CH);
+    });
+
+    ctx.font = `bold ${CH + 1}px "SF Mono", Menlo, Consolas, monospace`;
+    const inv = 1 / (SS * SS);
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        let R = 0, G = 0, B = 0;
+        for (let sy = 0; sy < SS; sy++) {
+          for (let sx = 0; sx < SS; sx++) {
+            const i = ((r * SS + sy) * pw + (c * SS + sx)) * 4;
+            R += pixels[i]; G += pixels[i + 1]; B += pixels[i + 2];
+          }
+        }
+        R *= inv; G *= inv; B *= inv;
+        const lum = 0.299 * R + 0.587 * G + 0.114 * B;
+        if (lum < 14) continue;
+        let idx = Math.round(clamp01(lum / 215) * (RAMP.length - 1));
+        const j = Math.random();
+        if (j < 0.08) idx = Math.max(0, idx - 1); else if (j > 0.94) idx = Math.min(RAMP.length - 1, idx + 1);
+        const k = 1.25;
+        ctx.fillStyle = `rgb(${Math.min(255, R * k) | 0},${Math.min(255, G * k) | 0},${Math.min(255, B * k) | 0})`;
+        ctx.fillText(RAMP[idx], c * CW, r * CH);
+      }
+    }
+    sprite.texture.source.update();
+  }
+
+  /* ---------- run / replay ---------- */
+  let t0 = performance.now();
+  function replay() { buildScene(); t0 = performance.now(); }
+  buildScene();
+
+  app.ticker.add(() => {
+    const t = (performance.now() - t0) / 1000;
+    updateColors(t);
+    updateScene(t);
+    drawAscii(t);
+  });
+
+  window.addEventListener("keydown", (e) => { if (e.key.toLowerCase() === "r") replay(); });
+  window.addEventListener("pointerdown", replay);
+})();
+</script>
+</body>
+</html>

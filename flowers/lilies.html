@@ -10,9 +10,12 @@
   canvas { height: 100vh !important; width: auto !important; max-width: 100vw; object-fit: contain; }
   #hint { position: fixed; bottom: 10px; left: 0; right: 0; text-align: center;
           font: 12px monospace; color: #ffffff55; pointer-events: none; }
+  #magic { position: fixed; top: 14px; left: 16px; right: 16px; text-align: center;
+           font: 14px monospace; color: #ffffffcc; pointer-events: none; }
 </style>
 </head>
 <body>
+<div id="magic">click or press r again for some magic</div>
 <div id="hint">click or press R to replay the bloom</div>
 
 <script src="https://cdn.jsdelivr.net/npm/pixi.js@8.6.6/dist/pixi.min.js"></script>
@@ -58,24 +61,33 @@
   const normAngle = (a) => ((((a + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
 
   /* ---------- petal / leaf shapes ---------- */
-  function makePetal(L, w, color, accent, dark) {
-    const g = new PIXI.Graphics();
-    g.moveTo(0, 0)
+  // Petals are drawn in white and coloured with tint, so a lily can change
+  // colour every frame without redrawing. role: index into [petal, accent, freckle].
+  function makePetal(L, w, shade, parts) {
+    const petal = new PIXI.Container();
+    const addPart = (g, role, partShade = 1) => { g.role = role; g.shade = partShade; petal.addChild(g); parts.push(g); };
+
+    addPart(new PIXI.Graphics()
+      .moveTo(0, 0)
       .bezierCurveTo(w * 0.95, -L * 0.25, w * 0.7, -L * 0.75, 0, -L)
       .bezierCurveTo(-w * 0.7, -L * 0.75, -w * 0.95, -L * 0.25, 0, 0)
-      .fill({ color });
+      .fill({ color: 0xffffff }), 0, shade);
     // lighter/darker inner stripe
-    g.moveTo(0, -L * 0.05)
+    addPart(new PIXI.Graphics()
+      .moveTo(0, -L * 0.05)
       .bezierCurveTo(w * 0.38, -L * 0.3, w * 0.25, -L * 0.7, 0, -L * 0.92)
       .bezierCurveTo(-w * 0.25, -L * 0.7, -w * 0.38, -L * 0.3, 0, -L * 0.05)
-      .fill({ color: accent, alpha: 0.55 });
+      .fill({ color: 0xffffff, alpha: 0.55 }), 1);
     // center vein
-    g.moveTo(0, -L * 0.08).lineTo(0, -L * 0.85).stroke({ width: 3, color: dark, alpha: 0.55 });
+    addPart(new PIXI.Graphics()
+      .moveTo(0, -L * 0.08).lineTo(0, -L * 0.85).stroke({ width: 3, color: 0xffffff, alpha: 0.55 }), 2);
     // freckles near the throat
+    const freckles = new PIXI.Graphics();
     for (let i = 0; i < 7; i++) {
-      g.circle(rnd(-w * 0.28, w * 0.28), -rnd(L * 0.12, L * 0.5), rnd(1.6, 3)).fill({ color: dark, alpha: 0.8 });
+      freckles.circle(rnd(-w * 0.28, w * 0.28), -rnd(L * 0.12, L * 0.5), rnd(1.6, 3)).fill({ color: 0xffffff, alpha: 0.8 });
     }
-    return g;
+    addPart(freckles, 2);
+    return petal;
   }
 
   function makeLeaf(len) {
@@ -89,26 +101,92 @@
   }
 
   /* ---------- bouquet definition ---------- */
-  //  x,y = flower head position, L = petal length, c = [petal, accent, freckle], d = start delay (s)
+  // Colours found in garden lilies, as [petal, accent, freckle].
+  const red = [0xd8232a, 0xff6a5a, 0x5e0710];
+  const pink = [0xd94fb5, 0xff9be0, 0x6a1257];
+  const cream = [0xf1e2cc, 0xffffff, 0x946b3a];
+  const gold = [0xe8c93a, 0xfff08a, 0x8a5a10];
+  const burgundy = [0x9c1632, 0xe0485f, 0x3a0510];
+  const peach = [0xe6a07a, 0xffd2b8, 0x8a3f1e];
+  const magenta = [0xb0307f, 0xf07cc0, 0x4a0a35];
+  const orange = [0xe8741e, 0xffb060, 0x7a2e08];
+  const blush = [0xf2a9c4, 0xffe0ea, 0x8a1f55];
+
+  //  x,y = flower head position, L = petal length, d = start delay (s),
+  //  c = this lily's own colours, starting with the one it opens in
   const DEFS = [
-    { x: 395, y: 500, L: 165, c: [0xd8232a, 0xff6a5a, 0x5e0710], d: 0.7, tilt: 0.95 },
-    { x: 262, y: 725, L: 138, c: [0xd94fb5, 0xff9be0, 0x6a1257], d: 0.25, tilt: 0.85 },
-    { x: 545, y: 690, L: 150, c: [0xf1e2cc, 0xffffff, 0x946b3a], d: 1.0, tilt: 0.8 },
-    { x: 228, y: 540, L: 125, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 0.0, tilt: 0.75 },
-    { x: 565, y: 495, L: 125, c: [0x9c1632, 0xe0485f, 0x3a0510], d: 0.45, tilt: 0.8 },
-    { x: 330, y: 840, L: 120, c: [0xe6a07a, 0xffd2b8, 0x8a3f1e], d: 0.85, tilt: 0.9 },
-    { x: 470, y: 880, L: 115, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 1.3, tilt: 0.85 },
-    { x: 405, y: 690, L: 135, c: [0xb0307f, 0xf07cc0, 0x4a0a35], d: 1.55, tilt: 0.95 },
-    { x: 628, y: 640, L: 100, c: [0xe8c93a, 0xfff08a, 0x8a5a10], d: 1.2, tilt: 0.7 },
-    { x: 165, y: 720, L: 100, c: [0xf1e2cc, 0xffffff, 0x946b3a], d: 0.6, tilt: 0.7 },
+    { x: 395, y: 500, L: 165, c: [red, burgundy, orange], d: 0.7, tilt: 0.95 },
+    { x: 262, y: 725, L: 138, c: [pink, blush, magenta], d: 0.25, tilt: 0.85 },
+    { x: 545, y: 690, L: 150, c: [cream, blush, peach], d: 1.0, tilt: 0.8 },
+    { x: 228, y: 540, L: 125, c: [gold, orange, cream], d: 0.0, tilt: 0.75 },
+    { x: 565, y: 495, L: 125, c: [burgundy, red, magenta], d: 0.45, tilt: 0.8 },
+    { x: 330, y: 840, L: 120, c: [peach, blush, orange], d: 0.85, tilt: 0.9 },
+    { x: 470, y: 880, L: 115, c: [gold, peach, cream], d: 1.3, tilt: 0.85 },
+    { x: 405, y: 690, L: 135, c: [magenta, pink, burgundy], d: 1.55, tilt: 0.95 },
+    { x: 628, y: 640, L: 100, c: [gold, cream, orange], d: 1.2, tilt: 0.7 },
+    { x: 165, y: 720, L: 100, c: [cream, gold, blush], d: 0.6, tilt: 0.7 },
   ];
 
   const STEM_TIME = 2.2, BLOOM_DELAY = 1.9, BLOOM_TIME = 2.6;
+  // Colour changes begin once the last lily has opened. Only one runs at a time:
+  // a lily fades for FADE_TIME, then HOLD_TIME passes before the next one starts.
+  const FIRST_CHANGE = Math.max(...DEFS.map((d) => d.d)) + BLOOM_DELAY + BLOOM_TIME + 0.4;
+  const FADE_TIME = 1.8, HOLD_TIME = 0.7;
   let flowers = [];
+  let changing = null, nextChangeAt = FIRST_CHANGE, queue = [], lastChanged = null, replays = 0;
+
+  const shuffled = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  // shade 0..1 darkens the colour, mix blends between two colours
+  const mixColor = (a, b, m, shade = 1) => {
+    const ch = (s) => Math.round(lerp((a >> s) & 255, (b >> s) & 255, m) * shade);
+    return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+  };
+
+  function paintLily(f, m) {
+    f.parts.forEach((part) => { part.tint = mixColor(f.colorFrom[part.role], f.colorTo[part.role], m, part.shade); });
+  }
+
+  // Every lily gets a turn before any lily repeats. It moves to whichever of its
+  // own colours the bouquet has least of, so the bunch never turns one colour.
+  function startNextChange(t) {
+    if (!queue.length) {
+      queue = shuffled(flowers);
+      if (queue[queue.length - 1] === lastChanged) queue.unshift(queue.pop());
+    }
+    const f = queue.pop();
+    const options = f.def.c.filter((c) => c !== f.colorTo);
+    const count = (c) => flowers.filter((o) => o.colorTo === c).length;
+    const fewest = Math.min(...options.map(count));
+    const best = options.filter((c) => count(c) === fewest);
+    f.colorFrom = f.colorTo;
+    f.colorTo = best[Math.floor(Math.random() * best.length)];
+    changing = { f, start: t };
+    lastChanged = f;
+  }
+
+  function updateColors(t) {
+    if (!changing && t >= nextChangeAt) startNextChange(t);
+    if (!changing) return;
+    const raw = clamp01((t - changing.start) / FADE_TIME);
+    paintLily(changing.f, easeInOut(raw));
+    if (raw >= 1) {
+      changing = null;
+      nextChangeAt = t + HOLD_TIME;
+    }
+  }
 
   function buildScene() {
     [grassLayer, stemLayer, leafLayer, flowerLayer].forEach((l) => l.removeChildren().forEach((c) => c.destroy({ children: true })));
     flowers = [];
+    changing = null; nextChangeAt = FIRST_CHANGE; queue = []; lastChanged = null;
 
     // grass blades at the base
     for (let i = 0; i < 16; i++) {
@@ -143,14 +221,14 @@
       const inner = new PIXI.Container();
       head.addChild(inner);
       const petals = [];
-      const [pc, ac, dk] = def.c;
+      const parts = [];
       const Lw = def.L, ww = def.L * 0.3;
       // back ring (0,120,240) then front ring (60,180,300)
       [0, 1].forEach((ring) => {
         for (let k = 0; k < 3; k++) {
           const idx = ring * 3 + k;
-          const shade = ring === 0 ? PIXI.Color.shared.setValue(pc).multiply(0xd8d8d8).toNumber() : pc;
-          const p = makePetal(Lw * (ring ? 1 : 0.94), ww * (ring ? 1 : 0.95), shade, ac, dk);
+          const shade = ring === 0 ? 0xd8 / 0xff : 1;
+          const p = makePetal(Lw * (ring ? 1 : 0.94), ww * (ring ? 1 : 0.95), shade, parts);
           p.openAngle = normAngle((ring * 60 + k * 120 + rnd(-8, 8)) * deg);
           p.closedAngle = (idx - 2.5) * 4 * deg;
           inner.addChild(p);
@@ -162,11 +240,16 @@
       head.visible = false;
       flowerLayer.addChild(head);
 
-      flowers.push({
-        def, sx, sy, ctrl, stemG, leaves, head, inner, petals, stamens,
+      // opens in its first colour, and in a random one of its own on a replay
+      const color = replays ? def.c[Math.floor(Math.random() * def.c.length)] : def.c[0];
+      const f = {
+        def, sx, sy, ctrl, stemG, leaves, head, inner, petals, parts, stamens,
+        colorFrom: color, colorTo: color,
         headRot: rnd(0, Math.PI * 2),
         swayPhase: rnd(0, 6.28), stamenSeed: [...Array(6)].map(() => rnd(-1, 1)),
-      });
+      };
+      paintLily(f, 1);
+      flowers.push(f);
     });
   }
 
@@ -312,11 +395,12 @@
 
   /* ---------- run / replay ---------- */
   let t0 = performance.now();
-  function replay() { buildScene(); t0 = performance.now(); }
+  function replay() { replays++; buildScene(); t0 = performance.now(); }
   buildScene();
 
   app.ticker.add(() => {
     const t = (performance.now() - t0) / 1000;
+    updateColors(t);
     updateScene(t);
     drawAscii(t);
   });

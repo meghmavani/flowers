@@ -12,7 +12,13 @@
 <iframe id="flower" title="today's flower"></iframe>
 <script>
   // To add a flower: put its file in flowers/ and add its name here.
-  const pages = ["tulips", "rose", "sunflower", "lilies"];
+  const pages = [
+    "tulips", "rose", "sunflower", "lilies",
+    "gerbera", "carnation", "chrysanthemum", "delphinium", "babys-breath",
+    "peony", "lisianthus", "lily-of-the-valley", "orchid", "calla-lily",
+    "snapdragon", "cosmos", "daisy", "aster", "ranunculus",
+    "hydrangea", "periwinkle", "scabiosa", "zinnia", "mimosa",
+  ];
 
   // Random order, but worked out from the date, so everyone gets the same
   // flower all day and no server is needed. Every flower appears once before
@@ -42,11 +48,29 @@
     return order[day % pages.length];
   }
 
-  const now = new Date();
-  const today = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86400000);
+  // The viewer's local calendar date as a whole number of days. Using the date
+  // rather than the clock means daylight saving can't shift it.
+  function dayNumber(date) {
+    return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000);
+  }
+
   const frame = document.getElementById("flower");
   frame.onload = () => frame.contentWindow.focus(); // so pressing R works straight away
-  frame.src = `flowers/${flowerForDay(today)}.html`;
+
+  let shownDay = null;
+  function showToday() {
+    const today = dayNumber(new Date());
+    if (today === shownDay) return;
+    shownDay = today;
+    frame.src = `flowers/${flowerForDay(today)}.html`;
+  }
+  showToday();
+
+  // A page left open moves on at local midnight, including one that was asleep
+  // through it, or that the browser restored from its back/forward cache.
+  setInterval(showToday, 1000);
+  document.addEventListener("visibilitychange", showToday);
+  window.addEventListener("pageshow", showToday);
 </script>
 </body>
 </html>
